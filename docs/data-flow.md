@@ -4,6 +4,40 @@
 
 This document explains how data flows through the RabbitMQ platform implementation, covering producer-to-consumer message flow, exchange routing strategies, and queue management patterns.
 
+## Simple Routing Key Example
+
+Here's the most basic example of how routing keys work in RabbitMQ:
+
+### Producer Side
+```go
+// Producer publishes a message with routing key "user.created"
+publisher.Publish(ctx, "events", "user.created", userData)
+```
+
+### Consumer Side
+```go
+// Consumer binds to the same routing key to receive messages
+consumer := Consumer{
+    Exchange:   "events",
+    QueueName:  "user-processor",
+    RoutingKey: "user.created",  // Must match producer's routing key
+}
+```
+
+### Flow Diagram
+```mermaid
+graph LR
+    A[Producer] -->|routing_key: user.created| B[Exchange: events]
+    B -->|binding: user.created| C[Queue: user-processor]
+    C --> D[Consumer]
+```
+
+**Key Points:**
+- Producer sends message to **exchange** with **routing key**
+- Exchange routes message to **queue** based on **binding**
+- Consumer receives message from **queue**
+- Routing key in publish must match binding pattern for delivery
+
 ## Architecture Overview
 
 ```mermaid
