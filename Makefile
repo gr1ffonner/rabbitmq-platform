@@ -13,9 +13,8 @@ run-producer:
 
 
 # Start all services
-up:
+up-dev:
 	COMPOSE_PROJECT_NAME=rabbitmq-platform docker compose -f docker-compose.yml  --env-file=.env up -d --build
-
 
 # Stop all services
 down:

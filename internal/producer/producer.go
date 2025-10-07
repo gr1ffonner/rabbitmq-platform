@@ -8,11 +8,6 @@ import (
 	"time"
 )
 
-const (
-	exchange   = "test"
-	routingKey = "test"
-)
-
 type Producer struct {
 	publisher broker.Publisher
 }
@@ -24,7 +19,8 @@ func NewProducer(publisher broker.Publisher) *Producer {
 }
 
 // publishMessage publishes synchronously
-func (c *Producer) PublishMessage(message any) error {
+func (c *Producer) PublishMessage(exchange, routingKey string, message any) error {
+	slog.Info("publishing message", "exchange", exchange, "routingKey", routingKey)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if c.publisher == nil {

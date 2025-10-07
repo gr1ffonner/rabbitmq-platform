@@ -10,7 +10,11 @@ import (
 )
 
 const (
-	message = "Hello, world"
+	message       = "dlq test message"
+	exchange      = "test"
+	routingKey    = "test"
+	dlqExchange   = "dlq-test"
+	dlqRoutingKey = "dlq-test"
 )
 
 type Message struct {
@@ -20,7 +24,7 @@ type Message struct {
 func main() {
 
 	msg := Message{
-		Message: "Hello, world",
+		Message: "json test field",
 	}
 
 	cfg, err := config.Load()
@@ -44,6 +48,6 @@ func main() {
 
 	prdcr := producer.NewProducer(mq.GetPublisher())
 
-	prdcr.PublishMessage(message)
-	prdcr.PublishMessage(msg)
+	prdcr.PublishMessage(exchange, routingKey, msg)
+	prdcr.PublishMessage(dlqExchange, dlqRoutingKey, message)
 }

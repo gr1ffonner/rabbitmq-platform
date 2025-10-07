@@ -1,7 +1,6 @@
 package consumer
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
 	"rabbitmq-platform/pkg/broker"
@@ -15,13 +14,14 @@ const (
 	Exchange   = "test"
 )
 
-func NewConsumer(ctx context.Context) broker.Consumer {
+func NewConsumer() broker.Consumer {
 	return broker.Consumer{
 		RoutingKey: RoutingKey,
 		QueueName:  QueueName,
 		Exchange:   Exchange,
-		ProcessFunc: func(msg amqp.Delivery) {
+		ProcessFunc: func(msg amqp.Delivery) error {
 			logMessage(msg)
+			return nil
 		},
 	}
 }
@@ -29,9 +29,9 @@ func NewConsumer(ctx context.Context) broker.Consumer {
 func logMessage(msg amqp.Delivery) {
 	var jsonMsg any
 	if err := json.Unmarshal(msg.Body, &jsonMsg); err == nil {
-		slog.Info("Message received", "queue", QueueName, "routing_key", RoutingKey, "message", jsonMsg)
+		slog.Info("message received", "queue", QueueName, "routing_key", RoutingKey, "message", jsonMsg)
 	} else {
-		slog.Warn("Message received is not valid JSON")
-		slog.Info("Message received", "queue", QueueName, "routing_key", RoutingKey, "message", string(msg.Body))
+		slog.Warn("message received is not valid JSON")
+		slog.Info("message received", "queue", QueueName, "routing_key", RoutingKey, "message", string(msg.Body))
 	}
 }

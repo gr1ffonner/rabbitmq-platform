@@ -2,6 +2,7 @@ package broker
 
 import (
 	"log/slog"
+	"rabbitmq-platform/pkg/dlq"
 	"sync"
 	"time"
 
@@ -35,7 +36,8 @@ type Consumer struct {
 	RoutingKey  string
 	QueueName   string
 	Exchange    string
-	ProcessFunc func(msg amqp.Delivery)
+	IsDLQNeeded bool
+	ProcessFunc func(msg amqp.Delivery) error // should return err for dlq handling
 }
 
 type RabbitMQClient struct {
@@ -86,63 +88,62 @@ func (c *RabbitMQClient) launchConsumers() {
 	defer c.mu.Unlock()
 
 	for _, cons := range c.consumers {
-		// Declare exchange for each consumer
-		err := c.conn.Channel.ExchangeDeclare(
-			cons.Exchange,
-			"topic",
-			true,
-			false,
-			false,
-			false,
-			nil,
-		)
+		ch := c.conn.Channel
+
+		err := ch.ExchangeDeclare(cons.Exchange, "topic", true, false, false, false, nil)
 		if err != nil {
-			slog.Error("cannot declare exchange", "error", err)
+			slog.Error("cannot declare main exchange", "error", err, "exchange", cons.Exchange)
 			continue
 		}
 
-		_, err = c.conn.Channel.QueueDeclare(
-			cons.QueueName,
-			true,
-			false,
-			false,
-			false,
-			nil,
-		)
-		if err != nil {
-			slog.Error("cannot declare queue", "error", err)
+		mainQueueArgs := amqp.Table{}
+		if cons.IsDLQNeeded {
+			// DLQ with TTL (auto-republishes back to main exchange)
+			dlqQueueName := cons.QueueName + dlq.DLQSuffix
+			dlqRoutingKey := cons.RoutingKey + dlq.DLQSuffix
+
+			slog.Info("declaring dead letter queue", "queue", dlqQueueName, "rk", dlqRoutingKey, "exchange", cons.Exchange)
+
+			dlqQueueArgs := amqp.Table{
+				"x-message-ttl":             int32(dlq.RetryTTLSeconds * 1000), // 30 seconds TTL
+				"x-dead-letter-exchange":    cons.Exchange,                     // Auto-republish to main exchange
+				"x-dead-letter-routing-key": cons.RoutingKey,                   // Back to original routing key
+			}
+			if _, err := ch.QueueDeclare(dlqQueueName, true, false, false, false, dlqQueueArgs); err != nil {
+				slog.Error("failed to declare DLQ", "error", err, "queue", dlqQueueName)
+				continue
+			}
+
+			if err := ch.QueueBind(dlqQueueName, dlqRoutingKey, cons.Exchange, false, nil); err != nil {
+				slog.Error("failed to bind DLQ", "error", err, "queue", dlqQueueName)
+				continue
+			}
+
+			mainQueueArgs = amqp.Table{
+				"x-dead-letter-exchange":    cons.Exchange,
+				"x-dead-letter-routing-key": dlqRoutingKey, // Send failed messages to DLQ routing key
+			}
+		}
+
+		slog.Info("declaring main queue", "queue", cons.QueueName, "rk", cons.RoutingKey, "exchange", cons.Exchange)
+		if _, err := ch.QueueDeclare(cons.QueueName, true, false, false, false, mainQueueArgs); err != nil {
+			slog.Error("failed to declare main queue", "error", err, "queue", cons.QueueName)
 			continue
 		}
 
-		err = c.conn.Channel.QueueBind(
-			cons.QueueName,
-			cons.RoutingKey,
-			cons.Exchange,
-			false,
-			nil,
-		)
+		err = ch.QueueBind(cons.QueueName, cons.RoutingKey, cons.Exchange, false, nil)
 		if err != nil {
 			slog.Error("cannot bind queue", "error", err)
 			continue
 		}
 
-		msgs, err := c.conn.Channel.Consume(
-			cons.QueueName,
-			"",
-			false,
-			false,
-			false,
-			false,
-			nil,
-		)
+		msgs, err := ch.Consume(cons.QueueName, "", false, false, false, false, nil)
 		if err != nil {
 			slog.Error("cannot consume queue", "error", err)
 			continue
 		}
 
 		go func(cn Consumer, deliveries <-chan amqp.Delivery) {
-			slog.Info("start consuming messages", "queue", cons.QueueName, "rk", cons.RoutingKey, "exchange", cons.Exchange)
-
 			for msg := range deliveries {
 				func() {
 					defer func() {
@@ -151,11 +152,39 @@ func (c *RabbitMQClient) launchConsumers() {
 						}
 					}()
 
-					cn.ProcessFunc(msg)
-
-					err = msg.Ack(false)
-					if err != nil {
-						slog.Error("failed to ack message", "error", err)
+					retryCount := dlq.GetRetryCountFromHeaders(msg.Headers)
+					slog.Info("start message processing",
+						"retry_count", retryCount,
+						"max_retries", dlq.MaxRetryAttempts,
+						"queue", cn.QueueName,
+						"rk", cn.RoutingKey,
+					)
+					err := cn.ProcessFunc(msg)
+					if err != nil && retryCount < dlq.MaxRetryAttempts {
+						slog.Warn("received error, nacking message", "error", err, "retry_count", retryCount, "max_retries", dlq.MaxRetryAttempts)
+						// some logic here
+						// retry/non retry err check logic
+						// for now nack the message and return, let the broker handle it
+						err = msg.Nack(false, false)
+						if err != nil {
+							slog.Error("failed to nack message", "error", err)
+						}
+						return
+					} else if err != nil && retryCount >= dlq.MaxRetryAttempts {
+						// max retries exceeded - ack the message and return
+						slog.Error("max retries exceeded - ack the message", "error", err, "retry_count", retryCount)
+						err = msg.Ack(false)
+						if err != nil {
+							slog.Error("failed to ack message", "error", err)
+						}
+					} else {
+						// non error case ack the message and return
+						slog.Info("message processed successfully", "retry_count", retryCount, "max_retries", dlq.MaxRetryAttempts)
+						err = msg.Ack(false)
+						if err != nil {
+							slog.Error("failed to ack message", "error", err)
+						}
+						return
 					}
 				}()
 			}
