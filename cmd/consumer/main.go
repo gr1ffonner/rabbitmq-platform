@@ -12,6 +12,16 @@ import (
 	"syscall"
 )
 
+const (
+	QueueName  = "test"
+	RoutingKey = "test"
+	Exchange   = "test"
+
+	DLQQueueName  = "dlq-test"
+	DLQRoutingKey = "dlq-test"
+	DLQExchange   = "dlq-test"
+)
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -25,24 +35,47 @@ func main() {
 
 	logger.Info("Config and logger initialized")
 
-	mq, err := broker.NewRabbitMQClient(cfg.RabbitMQDSN)
+	// Create RabbitMQ client
+	client, err := broker.NewRabbitMQClient(cfg.RabbitMQDSN)
 	if err != nil {
 		logger.Error("Failed to create RabbitMQ client", "error", err)
 		panic(err)
 	}
-	defer mq.Close()
+	defer client.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	cnsmr := consumer.NewConsumer(Exchange, QueueName, RoutingKey, false)
+	pkgConsumer, err := broker.NewConsumer(client, cnsmr.Config, cnsmr.ProcessMessage)
+	if err != nil {
+		logger.Error("Failed to create consumer", "error", err)
+		panic(err)
+	}
+	defer pkgConsumer.Stop()
+
+	dlqCnsmr := consumer.NewDLQConsumer(DLQExchange, DLQQueueName, DLQRoutingKey, true)
+	pkgDlqConsumer, err := broker.NewConsumer(client, dlqCnsmr.Config, dlqCnsmr.ProcessMessage)
+	if err != nil {
+		logger.Error("Failed to create DLQ consumer", "error", err)
+		panic(err)
+	}
+	defer pkgDlqConsumer.Stop()
+
+	pkgConsumer.Start(ctx)
+	pkgDlqConsumer.Start(ctx)
+
 	signalCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cnsm := consumer.NewConsumer()
-	dlqCnsm := consumer.NewDlqConsumer()
-
-	mq.RunConsumers(cnsm, dlqCnsm)
+	logger.Info("Consumers started, waiting for messages...")
 
 	<-signalCtx.Done()
-	logger.Info("Shutting down consumer")
+	logger.Info("Shutting down consumers...")
+
+	// Stop consumers gracefully
+	cancel()
+	// wg.Wait()
+
+	logger.Info("Consumers stopped successfully")
 }

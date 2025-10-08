@@ -1,229 +1,139 @@
 package broker
 
 import (
-	"log/slog"
-	"rabbitmq-platform/pkg/dlq"
 	"sync"
-	"time"
 
 	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type AMQPConn struct {
-	Conn    *amqp.Connection
-	Channel *amqp.Channel
+// RabbitMQClientInterface defines the interface for RabbitMQ client operations
+// This interface is used for mocking in tests
+type RabbitMQClientInterface interface {
+	Close() error
+	NewChannel() (*amqp.Channel, error)
+	IsConnected() bool
+	DeclareExchange(ch *amqp.Channel, name string) error
+	DeclareQueue(ch *amqp.Channel, name string, args amqp.Table) (amqp.Queue, error)
+	BindQueue(ch *amqp.Channel, queueName, routingKey, exchange string) error
 }
 
-func NewAMQPConn(dsn string) (*AMQPConn, error) {
+// RabbitMQClient manages RabbitMQ connection and provides infrastructure methods
+type RabbitMQClient struct {
+	conn *amqp.Connection
+	dsn  string
+	mu   sync.RWMutex
+}
+
+// NewRabbitMQClient creates a new RabbitMQ client with established connection
+func NewRabbitMQClient(dsn string) (*RabbitMQClient, error) {
 	conn, err := amqp.Dial(dsn)
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot connect to rabbitmq")
 	}
-	ch, err := conn.Channel()
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot create channel")
-	}
-	return &AMQPConn{Conn: conn, Channel: ch}, nil
+
+	return &RabbitMQClient{
+		conn: conn,
+		dsn:  dsn,
+	}, nil
 }
 
-func (r *AMQPConn) Close() error {
-	_ = r.Channel.Close()
-	return r.Conn.Close()
-}
-
-type Consumer struct {
-	RoutingKey  string
-	QueueName   string
-	Exchange    string
-	IsDLQNeeded bool
-	ProcessFunc func(msg amqp.Delivery) error // should return err for dlq handling
-}
-
-type RabbitMQClient struct {
-	mu            sync.Mutex
-	dsn           string
-	conn          *AMQPConn
-	consumers     []Consumer
-	done          chan struct{}
-	reconnectTime time.Duration
-	pub           Publisher
-}
-
-func NewRabbitMQClient(dsn string) (*RabbitMQClient, error) {
-	client := &RabbitMQClient{
-		dsn:           dsn,
-		done:          make(chan struct{}),
-		reconnectTime: 5 * time.Second,
-	}
-	if err := client.connectAndDeclare(); err != nil {
-		return nil, err
-	}
-	go client.monitorReconnect()
-	return client, nil
-}
-
-func (c *RabbitMQClient) connectAndDeclare() error {
-	conn, err := NewAMQPConn(c.dsn)
-	if err != nil {
-		return err
-	}
+// Close closes the RabbitMQ connection
+func (c *RabbitMQClient) Close() error {
 	c.mu.Lock()
-	c.conn = conn
-	c.mu.Unlock()
+	defer c.mu.Unlock()
 
-	c.pub = &publisher{
-		ch: conn.Channel,
+	if c.conn != nil && !c.conn.IsClosed() {
+		return c.conn.Close()
 	}
 	return nil
 }
 
-func (c *RabbitMQClient) RunConsumers(consumers ...Consumer) {
-	c.consumers = consumers
-	c.launchConsumers()
-}
+// NewChannel creates a new AMQP channel
+// Each consumer/producer should have its own channel for thread-safety
+func (c *RabbitMQClient) NewChannel() (*amqp.Channel, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-func (c *RabbitMQClient) launchConsumers() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for _, cons := range c.consumers {
-		ch := c.conn.Channel
-
-		err := ch.ExchangeDeclare(cons.Exchange, "topic", true, false, false, false, nil)
-		if err != nil {
-			slog.Error("cannot declare main exchange", "error", err, "exchange", cons.Exchange)
-			continue
-		}
-
-		mainQueueArgs := amqp.Table{}
-		if cons.IsDLQNeeded {
-			// DLQ with TTL (auto-republishes back to main exchange)
-			dlqQueueName := cons.QueueName + dlq.DLQSuffix
-			dlqRoutingKey := cons.RoutingKey + dlq.DLQSuffix
-
-			slog.Info("declaring dead letter queue", "queue", dlqQueueName, "rk", dlqRoutingKey, "exchange", cons.Exchange)
-
-			dlqQueueArgs := amqp.Table{
-				"x-message-ttl":             int32(dlq.RetryTTLSeconds * 1000), // 30 seconds TTL
-				"x-dead-letter-exchange":    cons.Exchange,                     // Auto-republish to main exchange
-				"x-dead-letter-routing-key": cons.RoutingKey,                   // Back to original routing key
-			}
-			if _, err := ch.QueueDeclare(dlqQueueName, true, false, false, false, dlqQueueArgs); err != nil {
-				slog.Error("failed to declare DLQ", "error", err, "queue", dlqQueueName)
-				continue
-			}
-
-			if err := ch.QueueBind(dlqQueueName, dlqRoutingKey, cons.Exchange, false, nil); err != nil {
-				slog.Error("failed to bind DLQ", "error", err, "queue", dlqQueueName)
-				continue
-			}
-
-			mainQueueArgs = amqp.Table{
-				"x-dead-letter-exchange":    cons.Exchange,
-				"x-dead-letter-routing-key": dlqRoutingKey, // Send failed messages to DLQ routing key
-			}
-		}
-
-		slog.Info("declaring main queue", "queue", cons.QueueName, "rk", cons.RoutingKey, "exchange", cons.Exchange)
-		if _, err := ch.QueueDeclare(cons.QueueName, true, false, false, false, mainQueueArgs); err != nil {
-			slog.Error("failed to declare main queue", "error", err, "queue", cons.QueueName)
-			continue
-		}
-
-		err = ch.QueueBind(cons.QueueName, cons.RoutingKey, cons.Exchange, false, nil)
-		if err != nil {
-			slog.Error("cannot bind queue", "error", err)
-			continue
-		}
-
-		msgs, err := ch.Consume(cons.QueueName, "", false, false, false, false, nil)
-		if err != nil {
-			slog.Error("cannot consume queue", "error", err)
-			continue
-		}
-
-		go func(cn Consumer, deliveries <-chan amqp.Delivery) {
-			for msg := range deliveries {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							_ = msg.Nack(false, false)
-						}
-					}()
-
-					retryCount := dlq.GetRetryCountFromHeaders(msg.Headers)
-					slog.Info("start message processing",
-						"retry_count", retryCount,
-						"max_retries", dlq.MaxRetryAttempts,
-						"queue", cn.QueueName,
-						"rk", cn.RoutingKey,
-					)
-					err := cn.ProcessFunc(msg)
-					if err != nil && retryCount < dlq.MaxRetryAttempts {
-						slog.Warn("received error, nacking message", "error", err, "retry_count", retryCount, "max_retries", dlq.MaxRetryAttempts)
-						// some logic here
-						// retry/non retry err check logic
-						// for now nack the message and return, let the broker handle it
-						err = msg.Nack(false, false)
-						if err != nil {
-							slog.Error("failed to nack message", "error", err)
-						}
-						return
-					} else if err != nil && retryCount >= dlq.MaxRetryAttempts {
-						// max retries exceeded - ack the message and return
-						slog.Error("max retries exceeded - ack the message", "error", err, "retry_count", retryCount)
-						err = msg.Ack(false)
-						if err != nil {
-							slog.Error("failed to ack message", "error", err)
-						}
-					} else {
-						// non error case ack the message and return
-						slog.Info("message processed successfully", "retry_count", retryCount, "max_retries", dlq.MaxRetryAttempts)
-						err = msg.Ack(false)
-						if err != nil {
-							slog.Error("failed to ack message", "error", err)
-						}
-						return
-					}
-				}()
-			}
-		}(cons, msgs)
+	if c.conn == nil {
+		return nil, errors.New("connection is nil")
 	}
-}
 
-func (c *RabbitMQClient) monitorReconnect() {
-	for {
-		notify := c.conn.Conn.NotifyClose(make(chan *amqp.Error))
-		err := <-notify
-		if err != nil {
-			slog.Error("rabbitmq connection closed", "error", err)
-		}
-
-		select {
-		case <-c.done:
-			return
-		default:
-			slog.Info("reconnecting to RabbitMQ...")
-			for {
-				time.Sleep(c.reconnectTime)
-				if err := c.connectAndDeclare(); err != nil {
-					slog.Error("reconnect failed", "error", err)
-					continue
-				}
-				slog.Info("reconnected to RabbitMQ")
-				c.launchConsumers()
-				break
-			}
-		}
+	ch, err := c.conn.Channel()
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot create channel")
 	}
+
+	return ch, nil
 }
 
-func (c *RabbitMQClient) Close() error {
-	close(c.done)
-	return c.conn.Close()
+// IsConnected checks if connection is alive
+func (c *RabbitMQClient) IsConnected() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.conn != nil && !c.conn.IsClosed()
 }
 
-func (c *RabbitMQClient) GetPublisher() Publisher {
-	return c.pub
+// DeclareExchange declares an exchange
+func (c *RabbitMQClient) DeclareExchange(ch *amqp.Channel, name string) error {
+	if ch == nil {
+		return errors.New("channel is nil")
+	}
+
+	err := ch.ExchangeDeclare(
+		name,
+		"topic",
+		true,
+		false, // autoDelete
+		false, // internal
+		false, // noWait
+		nil,   // args
+	)
+	if err != nil {
+		return errors.Wrap(err, "failed to declare exchange")
+	}
+
+	return nil
+}
+
+// DeclareQueue declares a queue
+func (c *RabbitMQClient) DeclareQueue(ch *amqp.Channel, name string, args amqp.Table) (amqp.Queue, error) {
+	if ch == nil {
+		return amqp.Queue{}, errors.New("channel is nil")
+	}
+
+	queue, err := ch.QueueDeclare(
+		name,
+		true,
+		false, // autoDelete
+		false, // exclusive
+		false, // noWait
+		args,
+	)
+	if err != nil {
+		return amqp.Queue{}, errors.Wrap(err, "failed to declare queue")
+	}
+
+	return queue, nil
+}
+
+// BindQueue binds a queue to an exchange with a routing key
+func (c *RabbitMQClient) BindQueue(ch *amqp.Channel, queueName, routingKey, exchange string) error {
+	if ch == nil {
+		return errors.New("channel is nil")
+	}
+
+	err := ch.QueueBind(
+		queueName,
+		routingKey,
+		exchange,
+		false, // noWait
+		nil,   // args
+	)
+	if err != nil {
+		return errors.Wrap(err, "failed to bind queue")
+	}
+
+	return nil
 }

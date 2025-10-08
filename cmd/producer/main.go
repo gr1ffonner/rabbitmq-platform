@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"log/slog"
+	"time"
 
 	"rabbitmq-platform/internal/producer"
 	"rabbitmq-platform/pkg/broker"
@@ -10,7 +12,6 @@ import (
 )
 
 const (
-	message       = "dlq test message"
 	exchange      = "test"
 	routingKey    = "test"
 	dlqExchange   = "dlq-test"
@@ -22,7 +23,6 @@ type Message struct {
 }
 
 func main() {
-
 	msg := Message{
 		Message: "json test field",
 	}
@@ -39,15 +39,34 @@ func main() {
 
 	logger.Info("Config and logger initialized")
 
-	mq, err := broker.NewRabbitMQClient(cfg.RabbitMQDSN)
+	// Create RabbitMQ client
+	client, err := broker.NewRabbitMQClient(cfg.RabbitMQDSN)
 	if err != nil {
 		logger.Error("Failed to create RabbitMQ client", "error", err)
 		panic(err)
 	}
-	defer mq.Close()
+	defer client.Close()
 
-	prdcr := producer.NewProducer(mq.GetPublisher())
+	// Create producer with default exchange
+	prdcr, err := producer.NewProducer(client, exchange)
+	if err != nil {
+		logger.Error("Failed to create producer", "error", err)
+		panic(err)
+	}
+	defer prdcr.Close()
 
-	prdcr.PublishMessage(exchange, routingKey, msg)
-	prdcr.PublishMessage(dlqExchange, dlqRoutingKey, message)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Publish to main exchange
+	if err := prdcr.PublishMessage(ctx, exchange, routingKey, msg); err != nil {
+		logger.Error("Failed to publish to main exchange", "error", err)
+	}
+
+	// Publish to DLQ exchange
+	if err := prdcr.PublishMessage(ctx, dlqExchange, dlqRoutingKey, "dlq test message"); err != nil {
+		logger.Error("Failed to publish to dlq exchange", "error", err)
+	}
+
+	logger.Info("Messages published successfully")
 }

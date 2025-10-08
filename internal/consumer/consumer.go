@@ -8,30 +8,32 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-const (
-	QueueName  = "test"
-	RoutingKey = "test"
-	Exchange   = "test"
-)
+type Consumer struct {
+	Config broker.ConsumerConfig
+}
 
-func NewConsumer() broker.Consumer {
-	return broker.Consumer{
-		RoutingKey: RoutingKey,
-		QueueName:  QueueName,
-		Exchange:   Exchange,
-		ProcessFunc: func(msg amqp.Delivery) error {
-			logMessage(msg)
-			return nil
+// Consumer for logging messages
+func NewConsumer(exchange, queueName, routingKey string, isDLQNeeded bool) Consumer {
+	return Consumer{
+		Config: broker.ConsumerConfig{
+			QueueName:   queueName,
+			Exchange:    exchange,
+			RoutingKey:  routingKey,
+			IsDLQNeeded: isDLQNeeded,
 		},
 	}
 }
 
-func logMessage(msg amqp.Delivery) {
+// ProcessMessage is a process function for consumer
+func (c *Consumer) ProcessMessage(msg amqp.Delivery) error {
+
 	var jsonMsg any
 	if err := json.Unmarshal(msg.Body, &jsonMsg); err == nil {
-		slog.Info("message received", "queue", QueueName, "routing_key", RoutingKey, "message", jsonMsg)
+		slog.Info("message received", "message", jsonMsg)
 	} else {
 		slog.Warn("message received is not valid JSON")
-		slog.Info("message received", "queue", QueueName, "routing_key", RoutingKey, "message", string(msg.Body))
+		slog.Info("message received", "message", string(msg.Body))
 	}
+
+	return nil
 }

@@ -9,51 +9,39 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-const (
-	testDlqQueueName  = "dlq-test"
-	testDlqRoutingKey = "dlq-test"
-	testDlqExchange   = "dlq-test"
-)
-
 var errFlag = true
 
-func NewDlqConsumer() broker.Consumer {
-	return broker.Consumer{
-		RoutingKey:  testDlqRoutingKey,
-		QueueName:   testDlqQueueName,
-		Exchange:    testDlqExchange,
-		IsDLQNeeded: true,
-		ProcessFunc: func(msg amqp.Delivery) error {
-			err := processDlq(msg)
-			if err != nil {
-				slog.Error(
-					"failed to process dlq message",
-					"err", err,
-					"rk", testDlqRoutingKey,
-					"queue", testDlqQueueName,
-					"body", string(msg.Body),
-				)
-				return err
-			}
-			return nil
+type DLQConsumer struct {
+	Config broker.ConsumerConfig
+}
+
+// NewTestDlqConsumerConfig creates a config for DLQ testing consumer
+func NewDLQConsumer(exchange, queueName, routingKey string, isDLQNeeded bool) DLQConsumer {
+	return DLQConsumer{
+		Config: broker.ConsumerConfig{
+			QueueName:   queueName,
+			Exchange:    exchange,
+			RoutingKey:  routingKey,
+			IsDLQNeeded: isDLQNeeded,
 		},
 	}
 }
 
-func processDlq(msg amqp.Delivery) error {
-
-	// for testing purposes
+// ProcessDlqMessage is a test process function for DLQ consumer
+// It simulates failing once and then succeeding
+func (c *DLQConsumer) ProcessMessage(msg amqp.Delivery) error {
+	// For testing purposes - fail on first attempt
 	if errFlag {
 		errFlag = false // Reset flag after first failure
-		return errors.New("random error")
+		return errors.New("random error for testing DLQ")
 	}
 
 	var jsonMsg any
 	if err := json.Unmarshal(msg.Body, &jsonMsg); err == nil {
-		slog.Info("message received", "message", jsonMsg)
+		slog.Info("dlq message received", "message", jsonMsg)
 	} else {
-		slog.Warn("message received is not valid JSON")
-		slog.Info("message received", "message", string(msg.Body))
+		slog.Warn("dlq message received is not valid JSON")
+		slog.Info("dlq message received", "message", string(msg.Body))
 	}
 
 	return nil
